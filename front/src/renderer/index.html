@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Card Ops</title>
+    <link rel="stylesheet" href="./main.css" />
+  </head>
+  <body>
+    <div class="bg-orb orb-a"></div>
+    <div class="bg-orb orb-b"></div>
+    <div class="shell">
+      <header class="hero">
+        <div>
+          <div class="eyebrow">CARD OPS</div>
+          <h1>训练 / 解析 / 悬浮窗</h1>
+        </div>
+        <div class="hero-stats">
+          <div class="stat-chip">
+            <span>局</span>
+            <strong id="heroGameIndex">1</strong>
+          </div>
+          <div class="stat-chip">
+            <span>轮到</span>
+            <strong id="heroTurnSeat">1</strong>
+          </div>
+          <div class="stat-chip">
+            <span>已录</span>
+            <strong id="heroEventCount">0</strong>
+          </div>
+          <div class="stat-chip">
+            <span>特征池</span>
+            <strong id="heroPoolCount">0</strong>
+          </div>
+        </div>
+      </header>
+
+      <main class="dashboard">
+        <section class="panel panel-launch">
+          <div class="panel-head">
+            <span class="panel-kicker">Launch</span>
+            <button id="startTrainingBtn" class="primary-btn">启动</button>
+          </div>
+          <div id="commandTabs" class="command-tabs"></div>
+          <form id="trainingForm" class="field-grid"></form>
+          <div class="output-card">
+            <div class="mini-title">
+              <span id="trainingStatus">idle</span>
+              <span id="trainingRunAt">-</span>
+            </div>
+            <pre id="trainingOutput" class="console"></pre>
+          </div>
+        </section>
+
+        <section class="panel panel-overlay">
+          <div class="panel-head">
+            <span class="panel-kicker">Overlay</span>
+            <div class="inline-actions">
+              <button id="openOverlayBtn" class="ghost-btn">打开</button>
+              <button id="closeOverlayBtn" class="ghost-btn">关闭</button>
+            </div>
+          </div>
+          <div class="overlay-grid">
+            <label class="toggle-card">
+              <span>顶层</span>
+              <input id="topmostToggle" type="checkbox" />
+            </label>
+            <label class="field-card">
+              <span>我在</span>
+              <select id="mySeatSelect">
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="3">3</option>
+                <option value="4">4</option>
+              </select>
+            </label>
+            <label class="field-card">
+              <span>轮到</span>
+              <select id="turnSeatSelect">
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="3">3</option>
+                <option value="4">4</option>
+              </select>
+            </label>
+            <label class="field-card">
+              <span>目标</span>
+              <select id="targetRankSelect">
+                <option value="A">A</option>
+                <option value="K">K</option>
+                <option value="Q">Q</option>
+              </select>
+            </label>
+          </div>
+          <div class="quick-actions">
+            <button id="undoBtn" class="ghost-btn">撤销</button>
+            <button id="redoBtn" class="ghost-btn">重做</button>
+            <button id="nextGameBtn" class="primary-btn alt">保存并下一局</button>
+          </div>
+          <div class="status-strip" id="seatStatusStrip"></div>
+        </section>
+
+        <section class="panel panel-reports">
+          <div class="panel-head">
+            <span class="panel-kicker">Reports</span>
+            <div class="inline-actions">
+              <button id="refreshReportsBtn" class="ghost-btn">刷新</button>
+              <button id="importReportBtn" class="primary-btn">导入特征</button>
+            </div>
+          </div>
+          <div class="reports-layout">
+            <div id="reportList" class="report-list"></div>
+            <div class="report-detail">
+              <div class="mini-title">
+                <span id="reportMode">未选择</span>
+                <span id="reportUpdatedAt">-</span>
+              </div>
+              <div id="reportSummaryGrid" class="report-summary-grid"></div>
+              <pre id="reportPreview" class="console compact"></pre>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel panel-pool">
+          <div class="panel-head">
+            <span class="panel-kicker">Feature Pool</span>
+            <span id="poolMeta" class="panel-meta">0 ids</span>
+          </div>
+          <div id="featurePoolList" class="pool-list"></div>
+        </section>
+      </main>
+    </div>
+
+    <script src="./main.js"></script>
+  </body>
+</html>

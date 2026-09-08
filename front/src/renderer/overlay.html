@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Overlay</title>
+    <link rel="stylesheet" href="./overlay.css" />
+  </head>
+  <body>
+    <div class="overlay-shell">
+      <header class="overlay-topbar">
+        <div>
+          <div class="overlay-eyebrow">LIVE TABLE</div>
+          <div class="overlay-title-row">
+            <h1 id="overlayTitle">第 1 局</h1>
+            <span id="overlaySubline">轮到 1 号位</span>
+            <span id="modelBadge" class="model-badge">v21_iter25 [0ffe95b8] 验证中</span>
+          </div>
+        </div>
+        <div class="overlay-toolbar">
+          <button id="overlayTopmostBtn" class="tool-btn">顶层</button>
+          <button id="overlayUndoBtn" class="tool-btn">撤销</button>
+          <button id="overlayRedoBtn" class="tool-btn">重做</button>
+          <button id="overlayNextGameBtn" class="tool-btn accent">下一局</button>
+          <button id="overlayHideBtn" class="tool-btn danger">隐藏</button>
+        </div>
+      </header>
+
+      <main class="overlay-main">
+        <section class="table-stage">
+          <div class="center-pot">
+            <div class="pot-ring"></div>
+            <div class="pot-meta">
+              <span>目标</span>
+              <strong id="centerTargetRank">A</strong>
+              <small id="centerStackCount">叠牌 0</small>
+            </div>
+          </div>
+          <div id="seatLayer" class="seat-layer"></div>
+        </section>
+
+        <aside class="history-panel">
+          <div class="advice-card">
+            <div class="history-head">
+              <span>建议</span>
+              <span id="adviceConfidence">-</span>
+            </div>
+            <div class="advice-main">
+              <strong id="adviceLabel">等待输入</strong>
+              <p id="adviceMeta">-</p>
+            </div>
+            <div id="adviceReasons" class="advice-reasons"></div>
+            <div id="adviceOptions" class="advice-options"></div>
+
+            <!-- 动作交互对象卡片 (实际接牌者 vs 质疑对象) -->
+            <div id="interactionTargetBox" class="interaction-target-box"></div>
+
+            <!-- 神经网络决策展示区 -->
+            <div id="neuralAdviceBox" class="neural-advice-box"></div>
+
+            <!-- 人工监督对局试用打卡抽屉 -->
+            <div id="trialDrawerBox" class="trial-drawer-box"></div>
+
+            <!-- POMDP 对手推断展示区 -->
+            <div id="pomdpBox" class="pomdp-box"></div>
+            <!-- 前瞻推演摘要展示区 -->
+            <div id="lookaheadBox" class="lookahead-box"></div>
+          </div>
+          <div class="history-head">
+            <span>记录</span>
+            <span id="historyCount">0</span>
+          </div>
+          <div id="historyList" class="history-list"></div>
+        </aside>
+      </main>
+
+      <section class="command-dock">
+        <div class="dock-row dock-meta">
+          <label>
+            <span>我在</span>
+            <select id="dockMySeat">
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+            </select>
+          </label>
+          <label>
+            <span>轮到</span>
+            <select id="dockTurnSeat">
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+            </select>
+          </label>
+          <label>
+            <span>目标</span>
+            <select id="dockTargetRank">
+              <option value="A">A</option>
+              <option value="K">K</option>
+              <option value="Q">Q</option>
+            </select>
+          </label>
+          <label>
+            <span>叠牌</span>
+            <input id="dockStackCount" type="number" min="0" max="99" value="0" />
+          </label>
+        </div>
+        <div class="dock-row dock-hand">
+          <label>
+            <span>我有目标</span>
+            <input id="heroTargetCount" type="number" min="0" max="5" value="0" />
+          </label>
+          <label>
+            <span>我有非目标</span>
+            <input id="heroNonTargetCount" type="number" min="0" max="5" value="0" />
+          </label>
+          <label>
+            <span>我有鬼</span>
+            <input id="heroGhostCount" type="number" min="0" max="5" value="0" />
+          </label>
+          <label>
+            <span>我有万能</span>
+            <input id="heroWildCount" type="number" min="0" max="5" value="0" />
+          </label>
+        </div>
+
+        <form id="eventForm" class="dock-row dock-event">
+          <label>
+            <span>seat</span>
+            <select id="eventSeat">
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+            </select>
+          </label>
+          <label>
+            <span>type</span>
+            <select id="eventType">
+              <option value="play">play</option>
+              <option value="challenge">challenge</option>
+              <option value="shot">shot</option>
+              <option value="status">status</option>
+              <option value="hand">hand</option>
+              <option value="note">note</option>
+            </select>
+          </label>
+          <label>
+            <span>count</span>
+            <select id="eventCount">
+              <option value="0">0</option>
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+            </select>
+          </label>
+          <label>
+            <span>claim</span>
+            <select id="eventClaimRank">
+              <option value="A">A</option>
+              <option value="K">K</option>
+              <option value="Q">Q</option>
+            </select>
+          </label>
+          <label>
+            <span>target</span>
+            <select id="eventTargetSeat">
+              <option value="">-</option>
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+            </select>
+          </label>
+          <label>
+            <span>状态</span>
+            <select id="eventStatusValue">
+              <option value="alive">alive</option>
+              <option value="eliminated">eliminated</option>
+              <option value="escaped">escaped</option>
+            </select>
+          </label>
+          <label>
+            <span>手牌</span>
+            <input id="eventHandCount" type="number" min="0" max="5" value="0" />
+          </label>
+          <label class="wide">
+            <span>组成 / 备注</span>
+            <input id="eventComposition" type="text" placeholder="目标 / 非目标 / 混出 / 鬼 ..." />
+          </label>
+          <label>
+            <span>下一位</span>
+            <select id="eventNextSeat">
+              <option value="">auto</option>
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+            </select>
+          </label>
+          <button class="event-submit" type="submit">记录</button>
+        </form>
+      </section>
+    </div>
+
+    <script src="./overlay.js"></script>
+  </body>
+</html>

@@ -1,0 +1,17 @@
+{
+  "name": "survival-card-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Desktop controller and overlay for the survival card backend",
+  "main": "src/main.js",
+  "scripts": {
+    "postinstall": "node scripts/ensure-electron.js",
+    "reinstall:electron": "node scripts/ensure-electron.js --force",
+    "start": "electron .",
+    "dev": "electron .",
+    "check": "node --check scripts/ensure-electron.js && node --check src/main.js && node --check src/preload.js && node --check src/state/session-store.js && node --check src/training/report-service.js && node --check src/renderer/main.js && node --check src/renderer/overlay.js"
+  },
+  "devDependencies": {
+    "electron": "^42.5.1"
+  }
+}
