@@ -1,0 +1,53 @@
+{
+  "release": "v54_frontstage_survival_desktop_route",
+  "source_experiment": "v54_frontstage_survival",
+  "evaluation_scope": {
+    "games_per_configuration": 1440,
+    "tables": ["strong_ppo", "style_honest", "shifting_mixed"],
+    "score_rules": [20, 15, -5, -30],
+    "note": "三桌等权描述性汇总；不是新增评测。"
+  },
+  "default_route": {
+    "frontstage": "v54_B_seed1_front.pt",
+    "duel": "v51_B_seed2_duel.pt",
+    "safe_takeover": "两人存活且当前质疑、开枪、淘汰及换轮结算完成"
+  },
+  "strong_table_route": {
+    "frontstage": "v54_A_seed1_front.pt",
+    "duel": "v51_B_seed2_duel.pt"
+  },
+  "metrics_overall_equal_table": {
+    "A_seed1_to_B2": {
+      "first_rate": 0.508333,
+      "top2_rate": 0.676042,
+      "fourth_rate": 0.169792,
+      "score_original_rules": 6.818
+    },
+    "B_seed1_to_B2": {
+      "first_rate": 0.516667,
+      "top2_rate": 0.673264,
+      "fourth_rate": 0.161806,
+      "score_original_rules": 7.003
+    },
+    "B_seed2_to_B2": {
+      "first_rate": 0.500694,
+      "top2_rate": 0.648153,
+      "fourth_rate": 0.168981,
+      "score_original_rules": 6.242
+    }
+  },
+  "artifacts": {
+    "v54_A_seed1_front.pt": {
+      "sha256": "3A04FA25A2A9468F14BE5AC5C3A0F938E9C00D65775314812C00E605602D8165"
+    },
+    "v54_B_seed1_front.pt": {
+      "sha256": "0C79F5D0ACE74B87B700F1DF8BFF938D33163BB4C5D533CC394768DC13ABFE2B"
+    },
+    "v51_B_seed2_duel.pt": {
+      "sha256": "E353C8071093434EE6C9E2D3F3F02CC53C3E8CF1C7AEF7559DBA78A2272C6997"
+    },
+    "v43_B10_front.pt": {
+      "sha256": "002D4126F577600233CF33C60D27EB78EA37ED94BEA91134AD00DFAE8FF4CBB7"
+    }
+  }
+}

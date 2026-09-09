@@ -9,8 +9,8 @@
    - 微型胶囊条 (Mini Bar) 模式 (~340x52)：角落极简悬浮，实时高亮 AI 核心决策与概率，支持拖拽与一键展开；
    - 完整控制面板 (Full Panel) 模式 (~420x680)：开局设置、方案B手牌输入、4席位状态与挂机开关、局势动作记录、AI深度概率推演；
 3. AI 决策与后端模型桥接：
-   - 自动加载生产主力 C_long (runs_ppo/v29_long_ppo/checkpoint_iter_00120.pt)；
-   - 支持动态下拉热切换 v37 争胜模型等备选权重；
+    - 默认启用 v54 混合路由：v54_B_seed1 前半场保底 + v51 B_seed2 两人局专家；
+    - 强手桌可切换为 v54_A_seed1 前半场，保留旧模型下拉热切换作为固定模型模式；
    - 采用 ProfilingFeatureEncoder(mode="control") 提取 104 维特征；
    - 桥接 ContextualActionPredictor 画像预测器与 POMDP 粒子滤波，推演上家虚报/诈唬率；
    - 神经网络 masked softmax 实时计算合法动作分布并输出最优建议；
@@ -28,6 +28,7 @@ import os
 from pathlib import Path
 import random
 import sys
+import traceback
 from typing import Any, Callable
 
 # 解决 Windows 终端编码问题
@@ -90,6 +91,8 @@ class Snapshot:
     public_history: list[PublicEvent]
     pending_penalty_seat: int | None
     round_starter_seat: int
+    pending_random_starter: bool
+    manual_starter_for_next_round: int | None
     hero_exact_hand: tuple[Card, ...] | None = None
 
 
@@ -128,6 +131,9 @@ class GameStateTracker:
         # 上一手出牌记录
         self.latest_play: dict[str, Any] | None = None
         self.pending_penalty_seat: int | None = None
+        # 鬼牌反杀后，真实牌局的下一轮先手可能需要人工确认；不擅自猜顺序。
+        self.pending_random_starter = False
+        self.manual_starter_for_next_round: int | None = None
 
         # 公开事件历史
         self.public_history: list[PublicEvent] = [
@@ -162,6 +168,8 @@ class GameStateTracker:
             public_history=copy.deepcopy(self.public_history),
             pending_penalty_seat=self.pending_penalty_seat,
             round_starter_seat=self.round_starter_seat,
+            pending_random_starter=self.pending_random_starter,
+            manual_starter_for_next_round=self.manual_starter_for_next_round,
             hero_exact_hand=self.hero_exact_hand,
         )
         self.undo_stack.append(snap)
@@ -191,6 +199,8 @@ class GameStateTracker:
         self.public_history = snap.public_history
         self.pending_penalty_seat = snap.pending_penalty_seat
         self.round_starter_seat = snap.round_starter_seat
+        self.pending_random_starter = snap.pending_random_starter
+        self.manual_starter_for_next_round = snap.manual_starter_for_next_round
         return True
 
     def reset_game(
@@ -225,6 +235,8 @@ class GameStateTracker:
         self.shots_taken = {s: 0 for s in range(1, 5)}
         self.latest_play = None
         self.pending_penalty_seat = None
+        self.pending_random_starter = False
+        self.manual_starter_for_next_round = None
 
         self.public_history = [
             PublicEvent(
@@ -303,6 +315,19 @@ class GameStateTracker:
                 return s
 
         return from_seat
+
+    def get_next_active_seat_in_order(self, from_seat: int) -> int:
+        """按席位顺序找下家，供人工纠正 UI 轮次；不因手牌数为 0 而跳过席位。"""
+        active_seats = [
+            seat for seat in range(1, self.player_count + 1)
+            if self.is_seat_active(seat)
+        ]
+        if not active_seats:
+            return from_seat
+        for seat in active_seats:
+            if seat > from_seat:
+                return seat
+        return active_seats[0]
 
     def toggle_afk(self, seat: int) -> bool:
         """切换某席位的挂机标记（仅用于战术偏好预估提示，绝对不篡改物理轮转与合法规则）。"""
@@ -448,6 +473,7 @@ class GameStateTracker:
             penalty_seat = challenging_seat
 
         self.pending_penalty_seat = penalty_seat
+        self.pending_random_starter = outcome == "ghost"
 
         self.public_history.append(
             PublicEvent(
@@ -485,9 +511,30 @@ class GameStateTracker:
         # 小轮结束，开启新小轮
         # 新一轮点数顺延循环：A -> K -> Q -> A
         next_rank_map = {Rank.A: Rank.K, Rank.K: Rank.Q, Rank.Q: Rank.A}
+        had_manual_starter = self.manual_starter_for_next_round is not None
         new_rank = next_rank_map.get(self.claim_rank, Rank.A)
-        starter = seat if not died and self.is_seat_active(seat) else self.get_next_active_seat(seat, allow_self=False)
+        starter = self.manual_starter_for_next_round
+        if starter is None or not self.is_seat_active(starter):
+            starter = seat if not died and self.is_seat_active(seat) else self.get_next_active_seat(seat, allow_self=False)
         self.reset_round(new_claim_rank=new_rank, starter_seat=starter)
+        self.manual_starter_for_next_round = None
+        if died and not had_manual_starter:
+            # 有人被淘汰后，下一轮先手由玩家按现场规则确认，不自动顺延。
+            self.pending_random_starter = True
+
+    def set_round_starter(self, seat: int) -> bool:
+        """人工确认鬼牌单出/结算后的先手，避免把随机结果误当成顺时针推导。"""
+        if not self.is_seat_active(seat):
+            return False
+        self.save_snapshot()
+        if self.pending_penalty_seat is not None:
+            # 鬼牌刚验出、尚未开枪：先记住选择，开枪后换轮时再应用。
+            self.manual_starter_for_next_round = seat
+        else:
+            self.current_seat = seat
+            self.round_starter_seat = seat
+        self.pending_random_starter = False
+        return True
 
     def build_private_observation(self) -> PrivateObservation:
         """构造供神经网络与特征提取器使用的精准 PrivateObservation。"""
@@ -584,18 +631,53 @@ class GameStateTracker:
 class AIDecisionEngine:
     """深度强化学习与上下文画像桥接推演引擎。"""
 
-    DEFAULT_MODEL_KEY: str = "C_long (主力 PPO v29)"
+    DEFAULT_MODEL_KEY: str = "v43_B10 (均衡探索候选，前二优先)"
+    V54_A1_FRONT_KEY: str = "v54_A_seed1 (强手桌前半场)"
+    V54_B1_FRONT_KEY: str = "v54_B_seed1 (偏诚实/变化桌前半场)"
+    V51_B2_DUEL_KEY: str = "v51_B_seed2 (两人局冻结专家)"
+    FIXED_ROUTE_LABEL: str = "固定模型（按上方模型）"
+    DEFAULT_ROUTE_KEY: str = "v54 混合路由（通用：B1前半场 → B2残局）"
 
     SUPPORTED_MODELS: dict[str, str] = {
-        "C_long (主力 PPO v29)": "runs_ppo/v29_long_ppo/checkpoint_iter_00120.pt",
+        "C_long (主力 PPO v29)": "../release/ppo_c_long_v29.pt",
+        "v47_add40 (强手增强，风格损失未确认)": "runs_ppo/v47_real_rule_extension/checkpoint_add40.pt",
+        "v43_B10 (均衡探索候选，前二优先)": "../release/v43_B10_front.pt",
         "v39_B10 (强 PPO 对抗候选，真人表现待验证)": "runs_ppo/v39_strong_opponent_pool/checkpoint_B_iter10.pt",
         "v37_B (争胜优先 PPO v37)": "runs_ppo/v37_win_priority/checkpoint_B_iter10.pt",
         "v35_B (课程迁移 PPO v35)": "runs_ppo/v35_curriculum_transfer/checkpoint_B_iter10.pt",
         "v38_Ext (长线微调 PPO v38)": "runs_ppo/v38_clong_extended/checkpoint_iter_00150_add30.pt",
+        V54_A1_FRONT_KEY: "../release/v54_A_seed1_front.pt",
+        V54_B1_FRONT_KEY: "../release/v54_B_seed1_front.pt",
+        V51_B2_DUEL_KEY: "../release/v51_B_seed2_duel.pt",
     }
 
-    def __init__(self, default_model_key: str = DEFAULT_MODEL_KEY) -> None:
+    ROUTES: dict[str, dict[str, str]] = {
+        DEFAULT_ROUTE_KEY: {
+            "front": V54_B1_FRONT_KEY,
+            "duel": V51_B2_DUEL_KEY,
+            "note": "通用桌：B1 前半场；两人局结算后切 B2",
+        },
+        "v54 混合路由（强手桌：A1前半场 → B2残局）": {
+            "front": V54_A1_FRONT_KEY,
+            "duel": V51_B2_DUEL_KEY,
+            "note": "强手桌：A1 前半场；两人局结算后切 B2",
+        },
+        "v54 混合路由（偏诚实/变化桌：B1前半场 → B2残局）": {
+            "front": V54_B1_FRONT_KEY,
+            "duel": V51_B2_DUEL_KEY,
+            "note": "偏诚实/变化桌：B1 前半场；两人局结算后切 B2",
+        },
+        "v43 + B2 保守基线": {
+            "front": DEFAULT_MODEL_KEY,
+            "duel": V51_B2_DUEL_KEY,
+            "note": "原 v43 前半场；两人局结算后切 B2",
+        },
+    }
+
+    def __init__(self, default_model_key: str = DEFAULT_MODEL_KEY, route_key: str | None = DEFAULT_ROUTE_KEY) -> None:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.route_key = route_key if route_key in self.ROUTES else None
+        self.route_stage = "固定模型"
         self.current_model_key = default_model_key
         self.actor: PPOActor | None = None
         self.encoder = ProfilingFeatureEncoder(mode="control")
@@ -612,7 +694,11 @@ class AIDecisionEngine:
         self._cached_signature: Any = None
         self._cached_sampled_action: dict[str, Any] | None = None
 
-        self.load_model(default_model_key)
+        initial_model_key = default_model_key
+        if self.route_key is not None:
+            initial_model_key = self.ROUTES[self.route_key]["front"]
+            self.route_stage = "前半场"
+        self.load_model(initial_model_key, preserve_route=True)
 
     def get_available_models(self) -> list[str]:
         """获取本地实际存在的模型键名列表。"""
@@ -622,16 +708,49 @@ class AIDecisionEngine:
                 available.append(name)
         return available if available else list(self.SUPPORTED_MODELS.keys())
 
-    def load_model(self, model_key: str) -> bool:
-        """加载或热切换指定的神经网络权重；遇到缺失或异常时安全自动回退至默认主力模型 C_long。"""
+    def get_available_routes(self) -> list[str]:
+        """返回 UI 可选路由；固定模型项用于临时关闭自动接管。"""
+        available = [self.FIXED_ROUTE_LABEL]
+        for route_key, route in self.ROUTES.items():
+            if all((ROOT_DIR / self.SUPPORTED_MODELS[key]).is_file() for key in (route["front"], route["duel"])):
+                available.append(route_key)
+        return available
+
+    def set_route(self, route_key: str | None) -> bool:
+        """切换混合路由，并立即加载该路由的当前阶段模型。"""
+        if route_key == self.FIXED_ROUTE_LABEL or route_key is None:
+            self.route_key = None
+            self.route_stage = "固定模型"
+            self._cached_signature = None
+            self._cached_sampled_action = None
+            return True
+        if route_key not in self.ROUTES:
+            return False
+        self.route_key = route_key
+        self.route_stage = "前半场"
+        self._cached_signature = None
+        self._cached_sampled_action = None
+        return self.load_model(self.ROUTES[route_key]["front"], preserve_route=True)
+
+    def route_status_text(self) -> str:
+        """用于界面显示当前路由与接管阶段。"""
+        if self.route_key is None:
+            return f"{self.FIXED_ROUTE_LABEL} · {self.current_model_key}"
+        return f"{self.route_key} · {self.route_stage} · {self.current_model_key}"
+
+    def load_model(self, model_key: str, *, preserve_route: bool = False) -> bool:
+        """加载或热切换指定的神经网络权重；遇到缺失或异常时安全自动回退至默认桌面模型。"""
+        if not preserve_route:
+            self.route_key = None
+            self.route_stage = "固定模型"
         rel_path = self.SUPPORTED_MODELS.get(model_key)
         target_key = model_key
 
         if not rel_path or not (ROOT_DIR / rel_path).is_file():
             print(f"[AIDecisionEngine] 找不到模型检查点: {model_key} (路径: {rel_path})")
             if model_key != self.DEFAULT_MODEL_KEY:
-                print(f"[AIDecisionEngine] 触发安全回退 -> 回退至默认生产主力: 【{self.DEFAULT_MODEL_KEY}】")
-                return self.load_model(self.DEFAULT_MODEL_KEY)
+                print(f"[AIDecisionEngine] 触发安全回退 -> 回退至默认桌面模型: 【{self.DEFAULT_MODEL_KEY}】")
+                return self.load_model(self.DEFAULT_MODEL_KEY, preserve_route=preserve_route)
             return False
 
         full_path = ROOT_DIR / rel_path
@@ -653,9 +772,36 @@ class AIDecisionEngine:
         except Exception as e:
             print(f"[AIDecisionEngine] 模型加载失败 ({target_key}): {e}")
             if target_key != self.DEFAULT_MODEL_KEY:
-                print(f"[AIDecisionEngine] 触发安全回退 -> 尝试载入默认生产主力: 【{self.DEFAULT_MODEL_KEY}】")
-                return self.load_model(self.DEFAULT_MODEL_KEY)
+                print(f"[AIDecisionEngine] 触发安全回退 -> 尝试载入默认桌面模型: 【{self.DEFAULT_MODEL_KEY}】")
+                return self.load_model(self.DEFAULT_MODEL_KEY, preserve_route=preserve_route)
             return False
+
+    @staticmethod
+    def _is_safe_duel_takeover(tracker: GameStateTracker) -> bool:
+        """只在两人存活且本轮结算彻底结束后允许 B2 接管。"""
+        alive_count = sum(1 for seat in range(1, 5) if tracker.player_alive.get(seat, False))
+        return (
+            alive_count == 2
+            and tracker.player_alive.get(tracker.hero_seat, False)
+            and tracker.latest_play is None
+            and tracker.pending_penalty_seat is None
+            and not tracker.pending_random_starter
+        )
+
+    def _apply_routing(self, tracker: GameStateTracker) -> None:
+        """根据当前安全阶段选择前半场模型或两人局专家。"""
+        if self.route_key is None:
+            self.route_stage = "固定模型"
+            return
+        route = self.ROUTES[self.route_key]
+        if self._is_safe_duel_takeover(tracker):
+            target_key = route["duel"]
+            self.route_stage = "两人局（结算后接管）"
+        else:
+            target_key = route["front"]
+            self.route_stage = "前半场"
+        if target_key != self.current_model_key:
+            self.load_model(target_key, preserve_route=True)
 
     def translate_abstract_action(self, label: str, claim_rank: Rank) -> tuple[str, str]:
         """将抽象动作标签翻译为人类友好的中文描述与标签图标。"""
@@ -705,6 +851,7 @@ class AIDecisionEngine:
     @torch.no_grad()
     def evaluate(self, tracker: GameStateTracker) -> dict[str, Any]:
         """推演当前局势，返回 AI 核心推荐、动作概率分布、上家虚报分析及战术提示。"""
+        self._apply_routing(tracker)
         obs = tracker.build_private_observation()
         legal_actions = tracker.generate_legal_actions()
 
@@ -812,6 +959,9 @@ class AIDecisionEngine:
             "action_dist": action_dist,
             "bluff_info": bluff_info,
             "tactical_tip": " ".join(tips),
+            "route_key": self.route_key,
+            "route_stage": self.route_stage,
+            "active_model_key": self.current_model_key,
         }
 
     def _get_state_signature(self, tracker: GameStateTracker) -> tuple:
@@ -867,6 +1017,12 @@ class ModernDarkTheme:
     ACCENT_PURPLE = "#d500f9"    # 鬼牌/紫
     ACCENT_BLUE = "#2979ff"      # 操作按钮/蓝
 
+    # 当前推荐卡专用色：深绿底保证白字和绿色标签都有足够对比度。
+    RECOMMEND_BG = "#123524"
+    RECOMMEND_BORDER = "#21c878"
+    RECOMMEND_FILL = "#147a45"
+    RECOMMEND_TEXT = "#eafff1"
+
 
 class DesktopAssistantUI:
     """逆水寒小丑牌双形态置顶桌面悬浮窗 UI。"""
@@ -879,11 +1035,13 @@ class DesktopAssistantUI:
         # 窗口基础特性：置顶、透明度、无边框
         self.is_mini_mode = False
         self.is_topmost = True
+        self.show_rank_controls = False
         self.root.title("逆水寒·小丑牌 决策助手")
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", 0.93)
         self.root.configure(bg=ModernDarkTheme.BG_MAIN)
         self.root.overrideredirect(True)
+        self.root.report_callback_exception = self._report_callback_exception
 
         # 拖拽窗口位移记录
         self.drag_x = 0
@@ -910,6 +1068,7 @@ class DesktopAssistantUI:
 
         # 绑定快捷键与事件
         self.root.bind("<Escape>", lambda e: self.toggle_mode())
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
 
         # 首次执行推演并渲染
         self.refresh_ui()
@@ -928,8 +1087,19 @@ class DesktopAssistantUI:
         new_y = event.y_root - self.drag_start_y
         self.root.geometry(f"+{new_x}+{new_y}")
 
+    def _report_callback_exception(self, exc: type[BaseException], value: BaseException, tb: Any) -> None:
+        """记录 Tk 回调异常；不让偶发 UI 事件错误直接变成无提示退出。"""
+        traceback.print_exception(exc, value, tb)
+
+    def _on_mini_double_click(self, _event: tk.Event) -> str:
+        """双击胶囊条时延后一拍展开，避免和拖拽/第二次点击重入。"""
+        self.root.after_idle(self.show_full_panel)
+        return "break"
+
     def show_mini_bar(self) -> None:
         """缩回微型胶囊条 (Mini Bar) 模式。"""
+        if self.is_mini_mode:
+            return
         curr_x = self.root.winfo_x()
         curr_y = self.root.winfo_y()
         self.full_panel_frame.pack_forget()
@@ -945,6 +1115,8 @@ class DesktopAssistantUI:
 
     def show_full_panel(self) -> None:
         """展开完整面板 (Full Panel) 模式。"""
+        if not self.is_mini_mode and self.full_panel_frame.winfo_ismapped():
+            return
         curr_x = self.root.winfo_x()
         curr_y = self.root.winfo_y()
         self.mini_bar_frame.pack_forget()
@@ -991,7 +1163,7 @@ class DesktopAssistantUI:
         # 拖拽绑定
         bar.bind("<ButtonPress-1>", self._start_drag)
         bar.bind("<B1-Motion>", self._do_drag)
-        bar.bind("<Double-Button-1>", lambda e: self.show_full_panel())
+        bar.bind("<Double-Button-1>", self._on_mini_double_click)
 
         # 拖拽指示手柄
         grip = tk.Label(
@@ -1019,7 +1191,7 @@ class DesktopAssistantUI:
         self.mini_text_label.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
         self.mini_text_label.bind("<ButtonPress-1>", self._start_drag)
         self.mini_text_label.bind("<B1-Motion>", self._do_drag)
-        self.mini_text_label.bind("<Double-Button-1>", lambda e: self.show_full_panel())
+        self.mini_text_label.bind("<Double-Button-1>", self._on_mini_double_click)
 
         # 展开按钮
         expand_btn = tk.Button(
@@ -1071,20 +1243,58 @@ class DesktopAssistantUI:
         # 1. 顶部标题栏
         self._build_header(outer)
 
+        # 主体使用 Canvas + Scrollbar，避免完整面板高度不足时下面内容被截断。
+        scroll_shell = tk.Frame(outer, bg=ModernDarkTheme.BG_MAIN)
+        scroll_shell.pack(fill=tk.BOTH, expand=True)
+        self.full_canvas = tk.Canvas(
+            scroll_shell,
+            bg=ModernDarkTheme.BG_MAIN,
+            highlightthickness=0,
+            bd=0,
+        )
+        self.full_scrollbar = ttk.Scrollbar(
+            scroll_shell,
+            orient=tk.VERTICAL,
+            command=self.full_canvas.yview,
+        )
+        self.full_canvas.configure(yscrollcommand=self.full_scrollbar.set)
+        self.full_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.full_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        content = tk.Frame(self.full_canvas, bg=ModernDarkTheme.BG_MAIN)
+        self.full_content = content
+        content_window = self.full_canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def update_scroll_region(_event: tk.Event) -> None:
+            self.full_canvas.configure(scrollregion=self.full_canvas.bbox("all"))
+
+        def fit_content_width(event: tk.Event) -> None:
+            self.full_canvas.itemconfigure(content_window, width=event.width)
+
+        content.bind("<Configure>", update_scroll_region)
+        self.full_canvas.bind("<Configure>", fit_content_width)
+
         # 2. 开局与席位设置区
-        self._build_game_setup_section(outer)
+        self._build_game_setup_section(content)
 
         # 3. 手牌输入区 (方案B)
-        self._build_hero_hand_section(outer)
+        self._build_hero_hand_section(content)
 
         # 4. 4席位状态与挂机开关
-        self._build_seats_status_section(outer)
+        self._build_seats_status_section(content)
 
         # 5. 局势动作记录区
-        self._build_actions_control_section(outer)
+        self._build_actions_control_section(content)
 
         # 6. AI 决策推演展示区
-        self._build_ai_inference_section(outer)
+        self._build_ai_inference_section(content)
+
+    def _on_mousewheel(self, event: tk.Event) -> None:
+        """鼠标滚轮滚动完整面板；胶囊条模式下不拦截滚轮。"""
+        if not self.is_mini_mode and hasattr(self, "full_canvas"):
+            delta = int(getattr(event, "delta", 0))
+            if delta:
+                self.full_canvas.yview_scroll(-max(1, abs(delta) // 120) * (1 if delta > 0 else -1), "units")
 
     def _build_header(self, parent: tk.Frame) -> None:
         """顶部精巧标题栏。"""
@@ -1155,6 +1365,23 @@ class DesktopAssistantUI:
         )
         self.topmost_btn.pack(side=tk.RIGHT, padx=2, pady=4)
 
+        # 设置入口：不常用的轮次点数控制默认隐藏，但保留可恢复开关。
+        settings_btn = tk.Button(
+            header,
+            text="⚙",
+            font=("Segoe UI Symbol", 9),
+            bg=ModernDarkTheme.BG_PANEL,
+            fg=ModernDarkTheme.TEXT_MUTED,
+            activebackground=ModernDarkTheme.BORDER,
+            activeforeground="#ffffff",
+            relief=tk.FLAT,
+            bd=0,
+            command=self._open_settings_dialog,
+            width=2,
+            cursor="hand2",
+        )
+        settings_btn.pack(side=tk.RIGHT, padx=2, pady=4)
+
         # 模型下拉切换
         available_models = self.engine.get_available_models()
         self.model_var = tk.StringVar(value=self.engine.current_model_key)
@@ -1169,13 +1396,109 @@ class DesktopAssistantUI:
         self.model_combo.pack(side=tk.RIGHT, padx=6, pady=4)
         self.model_combo.bind("<<ComboboxSelected>>", self._on_model_selected)
 
+    def _open_settings_dialog(self) -> None:
+        """打开轻量设置面板。"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("设置")
+        dialog.configure(bg=ModernDarkTheme.BG_MAIN)
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+
+        tk.Label(
+            dialog,
+            text="显示控制项",
+            font=("Microsoft YaHei UI", 9, "bold"),
+            bg=ModernDarkTheme.BG_MAIN,
+            fg=ModernDarkTheme.TEXT_MAIN,
+            anchor="w",
+        ).pack(fill=tk.X, padx=14, pady=(12, 4))
+
+        tk.Label(
+            dialog,
+            text="桌面助手路由",
+            font=("Microsoft YaHei UI", 9, "bold"),
+            bg=ModernDarkTheme.BG_MAIN,
+            fg=ModernDarkTheme.TEXT_MAIN,
+            anchor="w",
+        ).pack(fill=tk.X, padx=14, pady=(4, 2))
+
+        self.route_var = tk.StringVar(
+            value=self.engine.route_key or self.engine.FIXED_ROUTE_LABEL
+        )
+        route_combo = ttk.Combobox(
+            dialog,
+            textvariable=self.route_var,
+            values=self.engine.get_available_routes(),
+            state="readonly",
+            width=44,
+            font=("Microsoft YaHei UI", 8),
+        )
+        route_combo.pack(fill=tk.X, padx=14, pady=(0, 4))
+        route_combo.bind("<<ComboboxSelected>>", self._on_route_selected)
+
+        tk.Label(
+            dialog,
+            text="默认：B1 前半场；两人局结算完成后自动切 B2。强手桌可选 A1 版本。",
+            font=("Microsoft YaHei UI", 7),
+            bg=ModernDarkTheme.BG_MAIN,
+            fg=ModernDarkTheme.TEXT_MUTED,
+            anchor="w",
+            justify=tk.LEFT,
+            wraplength=330,
+        ).pack(fill=tk.X, padx=14, pady=(0, 8))
+
+        rank_var = tk.BooleanVar(value=self.show_rank_controls)
+        tk.Checkbutton(
+            dialog,
+            text="显示轮次点数 A / K / Q",
+            variable=rank_var,
+            command=lambda: self._apply_rank_controls_visibility(rank_var.get()),
+            bg=ModernDarkTheme.BG_MAIN,
+            fg=ModernDarkTheme.TEXT_MAIN,
+            activebackground=ModernDarkTheme.BG_MAIN,
+            activeforeground=ModernDarkTheme.TEXT_MAIN,
+            selectcolor=ModernDarkTheme.BG_SUBPANEL,
+            anchor="w",
+        ).pack(fill=tk.X, padx=14, pady=4)
+
+        tk.Button(
+            dialog,
+            text="关闭",
+            font=("Microsoft YaHei UI", 8),
+            bg=ModernDarkTheme.BG_SUBPANEL,
+            fg=ModernDarkTheme.TEXT_MAIN,
+            relief=tk.FLAT,
+            bd=0,
+            command=dialog.destroy,
+            padx=12,
+        ).pack(anchor="e", padx=14, pady=(6, 12))
+
+    def _apply_rank_controls_visibility(self, visible: bool) -> None:
+        self.show_rank_controls = bool(visible)
+        if not hasattr(self, "rank_controls_frame"):
+            return
+        if self.show_rank_controls:
+            self.rank_controls_frame.pack(fill=tk.X, padx=4, pady=2, before=self.round_control_frame)
+        else:
+            self.rank_controls_frame.pack_forget()
+
     def _on_model_selected(self, event: Any) -> None:
         selected = self.model_var.get()
         if selected != self.engine.current_model_key:
             self.engine.load_model(selected)
+            if hasattr(self, "route_var"):
+                self.route_var.set(self.engine.FIXED_ROUTE_LABEL)
             # 无论成功加载还是触发安全回退，均显示实际生效的模型版本
             self.model_var.set(self.engine.current_model_key)
             self.refresh_ui()
+
+    def _on_route_selected(self, event: Any) -> None:
+        """路由选择只改变桌面助手，不改训练产物或骰子项目。"""
+        selected = self.route_var.get()
+        if not self.engine.set_route(selected):
+            self.route_var.set(self.engine.route_key or self.engine.FIXED_ROUTE_LABEL)
+        self.model_var.set(self.engine.current_model_key)
+        self.refresh_ui()
 
     def _build_game_setup_section(self, parent: tk.Frame) -> None:
         """Section 1: 开局与席位设置区。"""
@@ -1226,9 +1549,10 @@ class DesktopAssistantUI:
         )
         rst_btn.pack(side=tk.RIGHT, padx=2)
 
-        # 锁定点数 A / K / Q
-        f2 = tk.Frame(sec, bg=ModernDarkTheme.BG_MAIN)
-        f2.pack(fill=tk.X, padx=4, pady=2)
+        # 锁定点数 A / K / Q：默认隐藏，设置中可恢复。
+        self.rank_controls_frame = tk.Frame(sec, bg=ModernDarkTheme.BG_MAIN)
+        self.rank_controls_frame.pack(fill=tk.X, padx=4, pady=2)
+        f2 = self.rank_controls_frame
 
         tk.Label(f2, text="轮次点数:", font=("Microsoft YaHei UI", 8), bg=ModernDarkTheme.BG_MAIN, fg=ModernDarkTheme.TEXT_MAIN).pack(side=tk.LEFT)
         self.rank_btns: dict[Rank, tk.Button] = {}
@@ -1246,9 +1570,11 @@ class DesktopAssistantUI:
             rb.pack(side=tk.LEFT, padx=3)
             self.rank_btns[r] = rb
 
-        # 新小轮按钮
+        # 新小轮按钮独立保留，不随轮次点数控制隐藏。
+        self.round_control_frame = tk.Frame(sec, bg=ModernDarkTheme.BG_MAIN)
+        self.round_control_frame.pack(fill=tk.X, padx=4, pady=2)
         round_btn = tk.Button(
-            f2,
+            self.round_control_frame,
             text="新小轮 (发牌)",
             font=("Microsoft YaHei UI", 8),
             bg=ModernDarkTheme.BG_SUBPANEL,
@@ -1261,6 +1587,60 @@ class DesktopAssistantUI:
             padx=4,
         )
         round_btn.pack(side=tk.RIGHT, padx=2)
+
+        # 行动轮换控制：手工记录时允许直接指定实际出牌席位，或顺位切到下家。
+        # 这组按钮常驻主界面，不再用模态弹窗阻塞用户输入。
+        self.turn_control_frame = tk.Frame(sec, bg=ModernDarkTheme.BG_MAIN)
+        self.turn_control_frame.pack(fill=tk.X, padx=4, pady=(1, 3))
+        tk.Label(
+            self.turn_control_frame,
+            text="行动控制:",
+            font=("Microsoft YaHei UI", 8, "bold"),
+            bg=ModernDarkTheme.BG_MAIN,
+            fg=ModernDarkTheme.TEXT_MAIN,
+        ).pack(side=tk.LEFT)
+        self.lbl_turn_control = tk.Label(
+            self.turn_control_frame,
+            text="当前席位 1",
+            font=("Microsoft YaHei UI", 8),
+            bg=ModernDarkTheme.BG_MAIN,
+            fg=ModernDarkTheme.TEXT_MUTED,
+        )
+        self.lbl_turn_control.pack(side=tk.LEFT, padx=(4, 6))
+
+        self.btn_turn_next = tk.Button(
+            self.turn_control_frame,
+            text="顺位到下家",
+            font=("Microsoft YaHei UI", 8, "bold"),
+            bg=ModernDarkTheme.BG_SUBPANEL,
+            fg=ModernDarkTheme.ACCENT_CYAN,
+            relief=tk.FLAT,
+            bd=0,
+            cursor="hand2",
+            command=self._on_cycle_turn,
+            padx=4,
+        )
+        self.btn_turn_next.pack(side=tk.LEFT, padx=2)
+
+        self.turn_seat_buttons: dict[int, tk.Button] = {}
+        for seat in range(1, 5):
+            btn = tk.Button(
+                self.turn_control_frame,
+                text=f"席位 {seat}",
+                font=("Microsoft YaHei UI", 8),
+                bg=ModernDarkTheme.BG_SUBPANEL,
+                fg=ModernDarkTheme.TEXT_MAIN,
+                relief=tk.FLAT,
+                bd=0,
+                width=5,
+                cursor="hand2",
+                command=lambda chosen=seat: self._on_manual_turn_select(chosen),
+            )
+            btn.pack(side=tk.LEFT, padx=1)
+            self.turn_seat_buttons[seat] = btn
+
+        if not self.show_rank_controls:
+            self.rank_controls_frame.pack_forget()
 
     def _on_set_hero_seat(self, seat: int) -> None:
         self.tracker.hero_seat = seat
@@ -1279,6 +1659,25 @@ class DesktopAssistantUI:
         next_rank_map = {Rank.A: Rank.K, Rank.K: Rank.Q, Rank.Q: Rank.A}
         self.tracker.reset_round(new_claim_rank=next_rank_map[self.tracker.claim_rank])
         self.refresh_ui()
+
+    def _on_manual_turn_select(self, seat: int) -> None:
+        """手工指定当前/下一轮实际先手，替代容易被忽略的模态确认框。"""
+        if not self.tracker.is_seat_active(seat):
+            return
+        if self.tracker.pending_random_starter or self.tracker.pending_penalty_seat is not None:
+            # 质疑结算尚未完成时，选择的是开枪后的下一轮先手；
+            # 已结算后则直接切换当前轮先手。
+            self.tracker.set_round_starter(seat)
+        else:
+            self.tracker.save_snapshot()
+            self.tracker.current_seat = seat
+        self.refresh_ui()
+
+    def _on_cycle_turn(self) -> None:
+        """按存活席位顺序切换下家，不按手牌数量跳过席位。"""
+        base_seat = self.tracker.manual_starter_for_next_round or self.tracker.current_seat
+        next_seat = self.tracker.get_next_active_seat_in_order(base_seat)
+        self._on_manual_turn_select(next_seat)
 
     def _build_hero_hand_section(self, parent: tk.Frame) -> None:
         """Section 2: 手牌输入区 (方案B)。"""
@@ -1541,6 +1940,12 @@ class DesktopAssistantUI:
         self.btn_hero_mix = tk.Button(self.row_hero_bluff, text="1真1杂", font=("Microsoft YaHei UI", 8), bg=ModernDarkTheme.BG_SUBPANEL, fg=ModernDarkTheme.TEXT_MAIN, relief=tk.FLAT, bd=0, width=6, cursor="hand2", command=lambda: self._on_record_hero_play(target_cnt=1, nontarget_cnt=1))
         self.btn_hero_mix.pack(side=tk.LEFT, padx=2)
 
+        self.btn_hero_mix_t2n1 = tk.Button(self.row_hero_bluff, text="2真1杂", font=("Microsoft YaHei UI", 8), bg=ModernDarkTheme.BG_SUBPANEL, fg=ModernDarkTheme.TEXT_MAIN, relief=tk.FLAT, bd=0, width=6, cursor="hand2", command=lambda: self._on_record_hero_play(target_cnt=2, nontarget_cnt=1))
+        self.btn_hero_mix_t2n1.pack(side=tk.LEFT, padx=2)
+
+        self.btn_hero_mix_t1n2 = tk.Button(self.row_hero_bluff, text="1真2杂", font=("Microsoft YaHei UI", 8), bg=ModernDarkTheme.BG_SUBPANEL, fg=ModernDarkTheme.TEXT_MAIN, relief=tk.FLAT, bd=0, width=6, cursor="hand2", command=lambda: self._on_record_hero_play(target_cnt=1, nontarget_cnt=2))
+        self.btn_hero_mix_t1n2.pack(side=tk.LEFT, padx=2)
+
         self.btn_hero_ghost = tk.Button(self.row_hero_bluff, text="👻出鬼", font=("Microsoft YaHei UI", 8), bg=ModernDarkTheme.BG_SUBPANEL, fg=ModernDarkTheme.ACCENT_PURPLE, relief=tk.FLAT, bd=0, width=5, cursor="hand2", command=lambda: self._on_record_hero_play(ghost=True))
         self.btn_hero_ghost.pack(side=tk.LEFT, padx=2)
 
@@ -1736,13 +2141,22 @@ class DesktopAssistantUI:
 
     def _on_record_challenge(self, outcome: str) -> None:
         acting_seat = self.tracker.current_seat
-        penalty_seat = self.tracker.record_challenge(acting_seat, outcome)
+        self.tracker.record_challenge(acting_seat, outcome)
         self.refresh_ui()
 
     def _on_record_shot(self, died: bool) -> None:
         target_seat = self.tracker.pending_penalty_seat or self.tracker.current_seat
         self.tracker.record_shot(target_seat, died)
         self.refresh_ui()
+        # 先手选择已经内嵌在主界面的“行动控制”条，不弹模态窗口。
+
+    def _prompt_starter_choice(self) -> None:
+        """兼容旧调用：先手确认已改为主界面内嵌，不创建模态窗口。"""
+        self.refresh_ui()
+
+    def _finish_ghost_starter_choice(self, dialog: tk.Toplevel, seat: int) -> None:
+        # 兼容旧绑定；新界面直接使用常驻席位按钮。
+        self._on_manual_turn_select(seat)
 
     def _on_undo(self) -> None:
         ok = self.tracker.undo()
@@ -1765,7 +2179,7 @@ class DesktopAssistantUI:
         # 当前加载模型版本指示条 (清晰展示实际生效的神经网络版本与候选定位)
         self.lbl_active_model_badge = tk.Label(
             sec,
-            text=f"🤖 当前决策网络: {self.engine.current_model_key}",
+            text=f"🤖 {self.engine.route_status_text()}",
             font=("Microsoft YaHei UI", 8),
             bg=ModernDarkTheme.BG_SUBPANEL,
             fg=ModernDarkTheme.ACCENT_CYAN,
@@ -1778,21 +2192,21 @@ class DesktopAssistantUI:
         # 核心高亮推荐卡片：清晰并列展示实战策略建议与策略最高项 (Argmax)
         self.rec_card = tk.Frame(
             sec,
-            bg=ModernDarkTheme.BG_PANEL,
-            highlightthickness=1,
-            highlightbackground=ModernDarkTheme.ACCENT_CYAN,
+            bg=ModernDarkTheme.RECOMMEND_BG,
+            highlightthickness=2,
+            highlightbackground=ModernDarkTheme.RECOMMEND_BORDER,
         )
         self.rec_card.pack(fill=tk.X, padx=4, pady=4)
 
         # 1. 实战建议行 (按策略分布随机抽取，纳什混合博弈行为)
-        row_sampled = tk.Frame(self.rec_card, bg=ModernDarkTheme.BG_PANEL)
+        row_sampled = tk.Frame(self.rec_card, bg=ModernDarkTheme.RECOMMEND_BG)
         row_sampled.pack(fill=tk.X, padx=6, pady=(4, 2))
         self.lbl_sampled_tag = tk.Label(
             row_sampled,
             text="🎲 实战建议 (按策略抽取):",
             font=("Microsoft YaHei UI", 8, "bold"),
-            bg=ModernDarkTheme.BG_PANEL,
-            fg=ModernDarkTheme.ACCENT_CYAN,
+            bg=ModernDarkTheme.RECOMMEND_BG,
+            fg=ModernDarkTheme.ACCENT_GREEN,
         )
         self.lbl_sampled_tag.pack(side=tk.LEFT)
 
@@ -1800,20 +2214,20 @@ class DesktopAssistantUI:
             row_sampled,
             text="跟牌出 1 张目标牌 (A)",
             font=("Microsoft YaHei UI", 9, "bold"),
-            bg=ModernDarkTheme.BG_PANEL,
-            fg="#ffffff",
+            bg=ModernDarkTheme.RECOMMEND_BG,
+            fg=ModernDarkTheme.RECOMMEND_TEXT,
         )
         self.lbl_sampled_desc.pack(side=tk.LEFT, padx=4)
 
         # 2. 策略最高权重项 (Argmax)
-        row_greedy = tk.Frame(self.rec_card, bg=ModernDarkTheme.BG_PANEL)
+        row_greedy = tk.Frame(self.rec_card, bg=ModernDarkTheme.RECOMMEND_BG)
         row_greedy.pack(fill=tk.X, padx=6, pady=(1, 4))
         self.lbl_greedy_tag = tk.Label(
             row_greedy,
             text="⭐ 策略最高权重 (Argmax):",
             font=("Microsoft YaHei UI", 8),
-            bg=ModernDarkTheme.BG_PANEL,
-            fg=ModernDarkTheme.TEXT_MUTED,
+            bg=ModernDarkTheme.RECOMMEND_BG,
+            fg="#9bc9ad",
         )
         self.lbl_greedy_tag.pack(side=tk.LEFT)
 
@@ -1821,8 +2235,8 @@ class DesktopAssistantUI:
             row_greedy,
             text="跟牌出 1 张目标牌 (A)",
             font=("Microsoft YaHei UI", 8),
-            bg=ModernDarkTheme.BG_PANEL,
-            fg=ModernDarkTheme.TEXT_MAIN,
+            bg=ModernDarkTheme.RECOMMEND_BG,
+            fg="#d6e8dc",
         )
         self.lbl_greedy_desc.pack(side=tk.LEFT, padx=4)
 
@@ -1891,6 +2305,29 @@ class DesktopAssistantUI:
             else:
                 btn.config(bg=ModernDarkTheme.BG_SUBPANEL, fg=ModernDarkTheme.TEXT_MAIN)
 
+        # 行动控制条：常驻显示当前席位；质疑/淘汰后的人工先手也在这里处理。
+        if hasattr(self, "turn_seat_buttons"):
+            if self.tracker.pending_penalty_seat is not None:
+                if self.tracker.manual_starter_for_next_round is not None:
+                    turn_hint = f"待开枪 · 下一轮已选席位 {self.tracker.manual_starter_for_next_round}"
+                else:
+                    turn_hint = f"待开枪 · 开枪后选先手"
+            elif self.tracker.pending_random_starter:
+                turn_hint = "待确认下一轮先手"
+            else:
+                turn_hint = f"当前席位 {self.tracker.current_seat}"
+            self.lbl_turn_control.config(text=turn_hint)
+            for seat, btn in self.turn_seat_buttons.items():
+                if not self.tracker.is_seat_active(seat):
+                    btn.config(state=tk.DISABLED, bg=ModernDarkTheme.BG_PANEL, fg=ModernDarkTheme.TEXT_DIM)
+                elif self.tracker.manual_starter_for_next_round == seat and self.tracker.pending_penalty_seat is not None:
+                    btn.config(state=tk.NORMAL, bg=ModernDarkTheme.ACCENT_GREEN, fg="#07130d")
+                elif seat == self.tracker.current_seat and self.tracker.pending_penalty_seat is None:
+                    btn.config(state=tk.NORMAL, bg=ModernDarkTheme.ACCENT_BLUE, fg="#ffffff")
+                else:
+                    btn.config(state=tk.NORMAL, bg=ModernDarkTheme.BG_SUBPANEL, fg=ModernDarkTheme.TEXT_MAIN)
+            self.btn_turn_next.config(state=tk.NORMAL if len([s for s in range(1, self.tracker.player_count + 1) if self.tracker.is_seat_active(s)]) > 1 else tk.DISABLED)
+
         # 2. 刷新手牌区计数
         self.lbl_target_cnt.config(text=str(self.tracker.hero_target_count))
         self.lbl_nontarget_cnt.config(text=str(self.tracker.hero_nontarget_count))
@@ -1908,7 +2345,12 @@ class DesktopAssistantUI:
             afk = self.tracker.player_afk.get(s, False)
             shots = self.tracker.shots_taken.get(s, 0)
             cards = self.tracker.seat_hand_counts.get(s, 0)
-            is_actor = (s == self.tracker.current_seat)
+            # 先手尚未人工确认时，current_seat 只是内部占位，不能把它显示成真实行动者。
+            is_actor = (
+                s == self.tracker.current_seat
+                and self.tracker.pending_penalty_seat is None
+                and not self.tracker.pending_random_starter
+            )
             is_hero = (s == self.tracker.hero_seat)
 
             # 行动者高亮
@@ -1949,14 +2391,24 @@ class DesktopAssistantUI:
             lp_c = self.tracker.latest_play["count"]
             lp_desc = f" | 上手: 席位{lp_s} 出{lp_c}张"
 
-        is_hero_turn = (self.tracker.current_seat == self.tracker.hero_seat)
+        is_hero_turn = (
+            self.tracker.current_seat == self.tracker.hero_seat
+            and self.tracker.pending_penalty_seat is None
+            and not self.tracker.pending_random_starter
+        )
 
         if self.tracker.pending_penalty_seat:
             p_seat = self.tracker.pending_penalty_seat
-            banner_text = f"🚨【待开枪: 席位 {p_seat} 受罚】请看游戏内开枪结果，点击右侧 [🔫幸存] 或 [💥淘汰]！"
+            starter_hint = "；下一轮先手用上方行动控制选择" if self.tracker.manual_starter_for_next_round is None else f"；下一轮先手已选席位 {self.tracker.manual_starter_for_next_round}"
+            banner_text = f"🚨【待开枪: 席位 {p_seat} 受罚】请看游戏内开枪结果，点击右侧 [🔫幸存] 或 [💥淘汰]！{starter_hint}"
             self.lbl_action_banner.config(text=banner_text, bg="#5c1d1d", fg="#ffdddd")
             self.btn_shot_survive.config(bg=ModernDarkTheme.ACCENT_CYAN, fg="#000000", font=("Microsoft YaHei UI", 8, "bold"))
             self.btn_shot_die.config(bg=ModernDarkTheme.ACCENT_RED, fg="#ffffff", font=("Microsoft YaHei UI", 8, "bold"))
+        elif self.tracker.pending_random_starter:
+            banner_text = "🟢【待确认下一轮先手】请用上方‘行动控制’选择实际先出席位，或点击‘顺位到下家’"
+            self.lbl_action_banner.config(text=banner_text, bg="#123524", fg="#eafff1")
+            self.btn_shot_survive.config(bg=ModernDarkTheme.BG_SUBPANEL, fg=ModernDarkTheme.ACCENT_CYAN, font=("Microsoft YaHei UI", 8))
+            self.btn_shot_die.config(bg=ModernDarkTheme.BG_SUBPANEL, fg=ModernDarkTheme.ACCENT_RED, font=("Microsoft YaHei UI", 8))
         elif is_hero_turn:
             banner_text = f"👉【轮到我方行动】选择你实际打出的牌或采纳AI建议{lp_desc}"
             self.lbl_action_banner.config(text=banner_text, bg="#1a3a2a", fg="#a7f3d0")
@@ -1969,7 +2421,10 @@ class DesktopAssistantUI:
             self.btn_shot_die.config(bg=ModernDarkTheme.BG_SUBPANEL, fg=ModernDarkTheme.ACCENT_RED, font=("Microsoft YaHei UI", 8))
 
         # 4.1 自适应切换我方行动 vs 对手行动面板
-        if is_hero_turn:
+        if self.tracker.pending_random_starter and self.tracker.pending_penalty_seat is None:
+            self.frame_hero_actions.pack_forget()
+            self.frame_opp_actions.pack_forget()
+        elif is_hero_turn:
             self.frame_opp_actions.pack_forget()
             self.frame_hero_actions.pack(fill=tk.X, padx=2, pady=1)
 
@@ -1985,6 +2440,8 @@ class DesktopAssistantUI:
             self._update_btn_state(self.btn_hero_nt2, nt_cnt >= 2, ModernDarkTheme.TEXT_MAIN)
             self._update_btn_state(self.btn_hero_nt3, nt_cnt >= 3, ModernDarkTheme.TEXT_MAIN)
             self._update_btn_state(self.btn_hero_mix, (t_cnt >= 1 and nt_cnt >= 1), ModernDarkTheme.TEXT_MAIN)
+            self._update_btn_state(self.btn_hero_mix_t2n1, (t_cnt >= 2 and nt_cnt >= 1), ModernDarkTheme.RECOMMEND_TEXT)
+            self._update_btn_state(self.btn_hero_mix_t1n2, (t_cnt >= 1 and nt_cnt >= 2), ModernDarkTheme.RECOMMEND_TEXT)
             self._update_btn_state(self.btn_hero_ghost, has_g, ModernDarkTheme.ACCENT_PURPLE)
 
             can_chal = (self.tracker.latest_play is not None and self.tracker.latest_play["seat"] != self.tracker.hero_seat)
@@ -1999,7 +2456,7 @@ class DesktopAssistantUI:
         # 5. 调用 AI 引擎计算并渲染推演卡片
         eval_result = self.engine.evaluate(self.tracker)
         if hasattr(self, "lbl_active_model_badge"):
-            self.lbl_active_model_badge.config(text=f"🤖 当前决策网络: {self.engine.current_model_key}")
+            self.lbl_active_model_badge.config(text=f"🤖 {self.engine.route_status_text()}")
 
         sampled_act = eval_result["sampled_action"]
         greedy_act = eval_result["greedy_action"]
@@ -2066,8 +2523,8 @@ class DesktopAssistantUI:
             # 背景条
             self.prob_canvas.create_rectangle(
                 8, y, w - 8, y + bar_h,
-                fill=ModernDarkTheme.BG_SUBPANEL,
-                outline=ModernDarkTheme.BORDER,
+                fill=ModernDarkTheme.RECOMMEND_BG if i == 0 and not is_chal else ModernDarkTheme.BG_SUBPANEL,
+                outline=ModernDarkTheme.RECOMMEND_BORDER if i == 0 and not is_chal else ModernDarkTheme.BORDER,
                 width=1,
             )
 
@@ -2075,7 +2532,7 @@ class DesktopAssistantUI:
             fill_w = max(4, int((w - 16) * prob))
             fill_color = ModernDarkTheme.ACCENT_RED if is_chal else ModernDarkTheme.ACCENT_CYAN
             if i == 0 and not is_chal:
-                fill_color = ModernDarkTheme.ACCENT_GREEN
+                fill_color = ModernDarkTheme.RECOMMEND_FILL
 
             self.prob_canvas.create_rectangle(
                 8, y, 8 + fill_w, y + bar_h,
@@ -2119,8 +2576,9 @@ def run_headless_tests() -> bool:
     print(f" -> 本地可用模型列表: {models}")
     assert len(models) >= 1, "未找到任何可用模型！"
     assert engine.actor is not None, "默认模型加载失败！"
-    assert engine.current_model_key == AIDecisionEngine.DEFAULT_MODEL_KEY
-    print(f" -> 默认生产主力模型加载成功 ({engine.current_model_key}): OK")
+    assert engine.route_key == AIDecisionEngine.DEFAULT_ROUTE_KEY
+    assert engine.current_model_key == AIDecisionEngine.V54_B1_FRONT_KEY
+    print(f" -> 默认混合路由加载成功 ({engine.route_status_text()}): OK")
 
     # 测试热加载 v39_B10 候选模型
     b10_key = "v39_B10 (强 PPO 对抗候选，真人表现待验证)"
@@ -2130,10 +2588,14 @@ def run_headless_tests() -> bool:
         assert engine.current_model_key == b10_key, "当前加载版本未正确更新为 v39_B10！"
         print(f" -> 成功热切换至候选模型 ({engine.current_model_key}): OK")
 
-    # 测试非法模型安全回退至默认生产主力 C_long
+    # 测试非法模型安全回退至默认桌面模型 v43_B10
     engine.load_model("Invalid_Non_Existent_Model_Key")
-    assert engine.current_model_key == AIDecisionEngine.DEFAULT_MODEL_KEY, "非法模型未能成功安全回退到默认主力 C_long！"
-    print(f" -> 非法模型安全回退机制验证成功 (已自动恢复为默认主力: {engine.current_model_key}): OK")
+    assert engine.current_model_key == AIDecisionEngine.DEFAULT_MODEL_KEY, "非法模型未能安全回退到默认桌面模型 v43_B10！"
+    print(f" -> 非法模型安全回退机制验证成功 (已自动恢复为默认桌面模型: {engine.current_model_key}): OK")
+
+    # 恢复默认混合路由，验证两人局只在结算完成后切换冻结 B2 专家。
+    assert engine.set_route(AIDecisionEngine.DEFAULT_ROUTE_KEY) is True
+    assert engine.current_model_key == AIDecisionEngine.V54_B1_FRONT_KEY
 
     # 2. 测试 GameStateTracker 状态初始化与手牌调整
     print("\n[Test 2/6] 测试 GameStateTracker 局势初始化与方案B手牌...")
@@ -2155,7 +2617,29 @@ def run_headless_tests() -> bool:
     print(f" -> 最优推荐: {eval_res['best_action_desc']} ({eval_res['best_prob']*100:.1f}%)")
     print(f" -> 动作分布总概率和: {total_prob:.4f}")
     assert abs(total_prob - 1.0) < 1e-3, "Softmax 动作概率和不为 1！"
+    assert eval_res["route_stage"] == "前半场"
     print(" -> 决策推演与 Softmax 归一化: OK")
+
+    duel_route_tracker = GameStateTracker(hero_seat=1, claim_rank=Rank.A, player_count=4)
+    for eliminated_seat in (3, 4):
+        duel_route_tracker.player_alive[eliminated_seat] = False
+        duel_route_tracker.seat_hand_counts[eliminated_seat] = 0
+    duel_eval = engine.evaluate(duel_route_tracker)
+    assert duel_eval["route_stage"] == "两人局（结算后接管）"
+    assert engine.current_model_key == AIDecisionEngine.V51_B2_DUEL_KEY
+    print(" -> 两人存活且结算完成后自动接管 B2 专家: OK")
+
+    # 质疑/开枪尚未结算时不得提前切换。
+    pending_duel_tracker = GameStateTracker(hero_seat=1, claim_rank=Rank.A, player_count=4)
+    for eliminated_seat in (3, 4):
+        pending_duel_tracker.player_alive[eliminated_seat] = False
+        pending_duel_tracker.seat_hand_counts[eliminated_seat] = 0
+    pending_duel_tracker.record_play(seat=2, count=1)
+    pending_duel_tracker.record_challenge(challenging_seat=1, outcome="lie")
+    pending_eval = engine.evaluate(pending_duel_tracker)
+    assert pending_eval["route_stage"] == "前半场"
+    assert engine.current_model_key == AIDecisionEngine.V54_B1_FRONT_KEY
+    print(" -> 质疑/开枪结算中禁止提前接管: OK")
 
     # 4. 测试对局流程演进：出牌、质疑与开枪结算
     print("\n[Test 4/6] 测试对局动作记录与轮转流转...")
@@ -2178,6 +2662,64 @@ def run_headless_tests() -> bool:
     tracker.record_shot(seat=2, died=False)
     assert tracker.shots_taken[2] == 1
     print(" -> 出牌、质疑、开枪与换轮流转: OK")
+
+    # 有人中弹淘汰后，下一轮先手也必须由玩家确认。
+    death_tracker = GameStateTracker(hero_seat=1, claim_rank=Rank.A, player_count=4)
+    death_tracker.record_play(seat=1, count=1)
+    death_tracker.record_challenge(challenging_seat=2, outcome="lie")
+    death_tracker.record_shot(seat=1, died=True)
+    assert death_tracker.pending_random_starter is True
+    assert death_tracker.player_alive[1] is False
+    assert death_tracker.set_round_starter(3) is True
+    assert death_tracker.current_seat == 3
+    assert death_tracker.pending_random_starter is False
+    print(" -> 有人淘汰后人工指定下一轮先手: OK")
+
+    # 鬼牌结算后不擅自推断随机先手，必须由玩家明确指定。
+    ghost_tracker = GameStateTracker(hero_seat=1, claim_rank=Rank.A, player_count=4)
+    ghost_tracker.record_play(seat=1, count=1)
+    ghost_tracker.record_challenge(challenging_seat=2, outcome="ghost")
+    assert ghost_tracker.pending_random_starter is True
+    assert ghost_tracker.set_round_starter(3) is True
+    assert ghost_tracker.pending_random_starter is False
+    ghost_tracker.record_shot(seat=2, died=False)
+    assert ghost_tracker.current_seat == 3
+    assert ghost_tracker.round_starter_seat == 3
+    print(" -> 鬼牌后人工指定下一轮先手: OK")
+
+    # 我方单独出鬼牌不触发先手选择，仍按普通出牌交给下一位。
+    ghost_play_tracker = GameStateTracker(hero_seat=1, claim_rank=Rank.A, player_count=4)
+    ghost_play_tracker.record_play(seat=1, count=1, hero_used_ghost=True)
+    assert ghost_play_tracker.pending_random_starter is False
+    assert ghost_play_tracker.current_seat == 2
+    assert ghost_play_tracker.pending_random_starter is False
+    print(" -> 单独出鬼牌不触发先手选择: OK")
+
+    # 同一小轮内允许先记对手出牌、后补录我方手牌，不得重置轮次或行动链。
+    order_tracker = GameStateTracker(hero_seat=1, player_count=2, claim_rank=Rank.A, starting_seat=2)
+    order_tracker.record_play(seat=2, count=2)
+    state_before_hand_input = (
+        order_tracker.round_index,
+        order_tracker.turn_index,
+        order_tracker.current_seat,
+        order_tracker.latest_play["seat"],
+        order_tracker.latest_play["count"],
+    )
+    order_tracker.set_hero_hand(target_count=1, nontarget_count=4, has_ghost=False)
+    state_after_hand_input = (
+        order_tracker.round_index,
+        order_tracker.turn_index,
+        order_tracker.current_seat,
+        order_tracker.latest_play["seat"],
+        order_tracker.latest_play["count"],
+    )
+    assert state_after_hand_input == state_before_hand_input
+    assert order_tracker.seat_hand_counts[1] == 5
+    print(" -> 同轮先记对手出牌、后补录我方手牌: OK")
+
+    assert order_tracker.get_next_active_seat_in_order(1) == 2
+    assert order_tracker.get_next_active_seat_in_order(2) == 1
+    print(" -> 人工顺位轮换不跳过空手牌席位: OK")
 
     # 5. 测试挂机功能 (AFK) 与撤销 (Undo)
     print("\n[Test 5/6] 测试挂机标记与撤销功能...")
@@ -2233,8 +2775,22 @@ def run_headless_tests() -> bool:
     assert tracker.hero_nontarget_count == 1, f"出2张杂牌后杂牌应剩余 1，实际: {tracker.hero_nontarget_count}"
     assert tracker.latest_play["count"] == 2
 
+    # 测试多真多杂组合出牌：2 真 1 杂、1 真 2 杂
+    tracker.current_seat = 1
+    tracker.set_hero_hand(target_count=2, nontarget_count=1, has_ghost=False)
+    ui._on_record_hero_play(target_cnt=2, nontarget_cnt=1)
+    assert tracker.hero_target_count == 0 and tracker.hero_nontarget_count == 0
+    assert tracker.latest_play["count"] == 3
+
+    tracker.current_seat = 1
+    tracker.set_hero_hand(target_count=1, nontarget_count=2, has_ghost=False)
+    ui._on_record_hero_play(target_cnt=1, nontarget_cnt=2)
+    assert tracker.hero_target_count == 0 and tracker.hero_nontarget_count == 0
+    assert tracker.latest_play["count"] == 3
+
     # 测试一键采纳 AI 实战建议
     tracker.current_seat = 1
+    tracker.set_hero_hand(target_count=2, nontarget_count=2, has_ghost=False)
     ui._on_adopt_ai_action()
     assert tracker.current_seat != 1, "采纳 AI 建议后应自动推进至下家行动！"
 
