@@ -16,6 +16,7 @@ python back/run_human_vs_ai.py --model_path release/ppo_c_long_v29.pt
 ```
 
 ## 模型说明
+- `release/checkpoint_oct07_latest.pt`: 10月7日最新旗舰模型 (October 7 Latest Flagship PPO Checkpoint · catch_plus5，抓假+5强化，全明星严格轮换与真随机打乱测试吃鸡率 56%~62%)
 - `release/ppo_c_long_v29.pt`: 主力模型 (PPO)
 - `release/deep_cfr_v21_baseline.pt`: 基线模型 (CFR)
 - `release/v54_B_seed1_front.pt`: v54 B_seed1 前半场保底模型
